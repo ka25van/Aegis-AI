@@ -45,11 +45,11 @@ spec:
               name: ollama
           resources:
             requests:
-              cpu: "1"
-              memory: "2Gi"
+              cpu: "500m"
+              memory: "1Gi"
             limits:
-              cpu: "4"
-              memory: "4Gi"
+              cpu: "2"
+              memory: "2Gi"
           volumeMounts:
             - name: models
               mountPath: /root/.ollama
@@ -114,4 +114,4 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: standard
+  storageClassName: hostpath
