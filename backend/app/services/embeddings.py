@@ -18,6 +18,9 @@ from app.models.memory import SemanticMemory
 from app.models.project import RepositoryFile, Repository
 from app.core.di import get_db_session
 from app.core.config import settings
+from app.core.reliability import CircuitBreaker
+
+_emb_breaker = CircuitBreaker(failure_threshold=5, window_s=60, recovery_timeout=30)
 
 
 class EmbeddingService:
@@ -27,34 +30,47 @@ class EmbeddingService:
         self.db = db
         self.ollama_base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
         self.embedding_model = getattr(settings, "EMBEDDING_MODEL", "nomic-embed-text")
-        self.embedding_dim = 768  # nomic-embed-text dimension
+        self.embedding_dim = 768  # nomic-embed-text via Ollama only — DB Vector(768)
 
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts using Ollama."""
+        """Generate embeddings with CircuitBreaker — fast-fail when Ollama down."""
         if not texts:
             return []
+        if not _emb_breaker.allow_request():
+            logger.warning("Embedding circuit breaker %s, skipping %d texts", _emb_breaker.state, len(texts))
+            return [[0.0] * self.embedding_dim for _ in texts]
 
-        embeddings = []
+        embeddings: List[List[float]] = []
+        success = 0
+        failed = 0
         async with httpx.AsyncClient(timeout=60.0) as client:
             for text in texts:
                 try:
                     response = await client.post(
                         f"{self.ollama_base_url}/api/embeddings",
-                        json={
-                            "model": self.embedding_model,
-                            "prompt": text[:8000],  # Truncate if too long
-                        },
+                        json={"model": self.embedding_model, "prompt": text[:8000]},
                     )
                     if response.status_code == 200:
                         data = response.json()
-                        embeddings.append(data.get("embedding", []))
+                        emb = data.get("embedding", [])
+                        if emb and len(emb) == self.embedding_dim:
+                            embeddings.append(emb)
+                            success += 1
+                        else:
+                            embeddings.append([0.0] * self.embedding_dim)
+                            failed += 1
                     else:
-                        # Fallback: zero vector
                         embeddings.append([0.0] * self.embedding_dim)
+                        failed += 1
                 except Exception as e:
-                    logger.warning(f"Embedding generation failed: {e}")
+                    logger.warning("Embedding generation failed: %s", e)
                     embeddings.append([0.0] * self.embedding_dim)
+                    failed += 1
 
+        if success > 0:
+            _emb_breaker.record_success()
+        if failed > 0 and failed == len(texts):
+            _emb_breaker.record_failure()
         return embeddings
 
     async def embed_and_store_document_chunks(self, document_id: UUID) -> Dict:

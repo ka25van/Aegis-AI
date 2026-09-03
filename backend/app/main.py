@@ -25,9 +25,25 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("application_starting")
+    logger.info("application_starting", env=getattr(settings, "ENV", "dev"))
     await container.initialize()
+    if not container.is_redis_available():
+        logger.warning("application_starting_without_redis_fallback_active")
+    # Optional: Langfuse OTEL instrumentation (no-op if not configured)
+    try:
+        from app.services.tracing import get_langfuse
+
+        get_langfuse()
+    except Exception:
+        pass
     yield
+    logger.info("application_shutting_down_graceful")
+    try:
+        from app.services.tracing import flush as flush_langfuse
+
+        flush_langfuse()
+    except Exception:
+        pass
     await container.shutdown()
     logger.info("application_shutting_down")
 
@@ -74,6 +90,18 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
@@ -93,4 +121,48 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """Liveness — always 200 if process is up."""
+    return {"status": "ok", "version": settings.VERSION}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness — checks DB + Redis (K8s readinessProbe)."""
+    checks: dict = {}
+    ok = True
+    # DB
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as e:
+        checks["db"] = f"fail: {e}"
+        ok = False
+    # Redis
+    try:
+        from app.core.redis import get_redis
+        r = get_redis()
+        await r.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"fail: {e}"
+        ok = False
+    # Ollama (optional — not required for readiness, but report)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=2) as c:
+            resp = await c.get(f"{settings.OLLAMA_BASE_URL}/api/tags")
+            checks["ollama"] = "ok" if resp.status_code == 200 else f"fail:{resp.status_code}"
+    except Exception as e:
+        checks["ollama"] = f"unavailable: {e}"
+
+    status_code = 200 if ok else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status_code, content={"status": "ready" if ok else "not_ready", "checks": checks})
+
+
+@app.get("/live")
+async def liveness_check():
+    return {"status": "alive"}

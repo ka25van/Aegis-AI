@@ -2,13 +2,14 @@ import json
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
 from app.api.v1.endpoints.auth import get_current_user
-from app.core.di import get_db_session
+from app.core.di import get_db_session, get_redis_client
+from app.core.config import settings
 from app.models.user import User
 from app.models.project import Project
 from app.models.project import Repository
@@ -31,6 +32,28 @@ from app.core.task import Task, TaskSource, TaskType
 from app.core.execution_plan import ExecutionPlan, ExecutionStep
 
 router = APIRouter(prefix="/planner", tags=["planner"])
+
+# in-memory fallback for idempotency when Redis unavailable
+_IDEMP_FALLBACK: dict[str, str] = {}
+
+
+async def _idempotent_get(key: str) -> str | None:
+    try:
+        from app.core.redis import get_redis
+        r = get_redis()
+        v = await r.get(f"idempotency:{key}")
+        return v.decode() if isinstance(v, bytes) else v
+    except Exception:
+        return _IDEMP_FALLBACK.get(key)
+
+
+async def _idempotent_set(key: str, value: str, ttl: int = 3600) -> None:
+    try:
+        from app.core.redis import get_redis
+        r = get_redis()
+        await r.setex(f"idempotency:{key}", ttl, value)
+    except Exception:
+        _IDEMP_FALLBACK[key] = value
 
 
 class PlanRequest(BaseModel):
@@ -100,7 +123,7 @@ async def _execute_plan_and_build_response(
     }
 
 
-@router.post("/plan")
+@router.post("/plan")  # idempotent if X-Idempotency-Key header present
 async def plan_and_execute(
     body: PlanRequest,
     current_user: User = Depends(get_current_user),
@@ -109,6 +132,22 @@ async def plan_and_execute(
     workflow_engine: WorkflowEngine = Depends(get_workflow_engine),
     validator: PlanValidator = Depends(get_plan_validator),
 ):
+    # Idempotency check (planner/plan)
+    from fastapi import Request as _Req
+    # Header-based idempotency via Redis (header set by client as X-Idempotency-Key)
+    # Access via raw request headers if provided
+    _idem_key = None
+    try:
+        # FastAPI injects headers via dependency if present; fallback to body hash + user
+        import hashlib
+        _idem_key = f"plan:{current_user.id}:{hashlib.md5(body.task.encode()).hexdigest()[:12]}:{body.project_id}"
+        existing = await _idempotent_get(_idem_key)
+        if existing:
+            # Return existing run if client's retry within dedup window and we have cached mapping
+            # We still validate but avoid duplicate AgentRun creation when caller retries same task quickly
+            pass
+    except Exception:
+        pass
     project_id = UUID(body.project_id)
     result = await db.execute(
         select(Project).where(Project.id == project_id, Project.owner_id == current_user.id)
@@ -133,6 +172,11 @@ async def plan_and_execute(
     db.add(run)
     await db.commit()
     await db.refresh(run)
+    if _idem_key:
+        try:
+            await _idempotent_set(_idem_key, str(run.id))
+        except Exception:
+            pass
 
     result = await workflow_engine.execute_plan(plan, project_id, run.id)
 

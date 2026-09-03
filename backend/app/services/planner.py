@@ -18,6 +18,12 @@ from app.core.di import get_db_session
 from app.core.config import settings
 from app.core.execution_plan import ExecutionPlan, ExecutionStep, RetryPolicy, RollbackStrategy
 
+try:
+    from langfuse import observe, get_client
+except ImportError:
+    observe = lambda *a, **kw: (lambda f: f)  # type: ignore
+    get_client = lambda: None  # type: ignore
+
 
 AGENT_NAMES = {
     "repository": "RepositoryAgent",
@@ -57,12 +63,19 @@ class PlannerAgent:
                 parts.append(text[:500])
         return "\nRelated past context:\n" + "\n---\n".join(parts) if parts else ""
 
+    @observe(name="planner.plan", as_type="span", capture_input=False, capture_output=False)
     async def plan(self, task: Task) -> ExecutionPlan:
         """Produce an ExecutionPlan by decomposing the task.
         
         No side effects — no DB writes, no agent calls, no LLM execution.
         Only reasoning.
         """
+        try:
+            lf = get_client()
+            if lf:
+                lf.update_current_span(input={"task": task.input, "project_id": str(getattr(task, 'project_id', ''))})
+        except Exception:
+            pass
         task_str = task.input
         memory_context = await self._inject_memory_context(task_str) if self.memory else ""
         system_prompt = f"Break this software engineering task into 2-4 steps. For each step, describe what needs to be done. Format as JSON: [{{'step': 1, 'name': '...', 'description': '...', 'capability': 'repository|knowledge|incident|documentation|code_review|deploy'}}]{memory_context}"
@@ -255,8 +268,15 @@ class IntentRouter:
             required_capabilities=["repository", "knowledge"],
         )
 
+    @observe(name="intent-router.route", as_type="span", capture_input=False, capture_output=False)
     async def route(self, ec: EngineeringContext) -> ExecutionPlan:
         """Classify user input and produce an ExecutionPlan."""
+        try:
+            lf = get_client()
+            if lf:
+                lf.update_current_span(input={"user_input": ec.task.input, "project_id": str(getattr(ec.task, 'project_id', ''))})
+        except Exception:
+            pass
         user_input = ec.task.input
         lower = user_input.lower()
 
@@ -321,17 +341,30 @@ Return ONLY valid JSON with these keys:
             plan = json.loads(result)
             required = plan.get("required_agents", [])
             if required and all(a in self.AGENT_DESCRIPTIONS for a in required):
-                return ExecutionPlan(
+                routed = ExecutionPlan(
                     intent=plan.get("intent", keyword_plan.intent),
                     task_description=user_input,
                     steps=self._agents_to_steps(required, user_input, plan.get("needs_approval", False)),
                     required_capabilities=required,
                     approvals_required=["step-1"] if plan.get("needs_approval") else [],
                 )
+                try:
+                    lf = get_client()
+                    if lf:
+                        lf.update_current_span(output={"intent": routed.intent, "required_capabilities": routed.required_capabilities, "via": "llm"})
+                except Exception:
+                    pass
+                return routed
         except (json.JSONDecodeError, TypeError, KeyError):
             pass
 
         # Fallback to keyword routing
+        try:
+            lf = get_client()
+            if lf:
+                lf.update_current_span(output={"intent": keyword_plan.intent, "required_capabilities": keyword_plan.required_capabilities, "via": "keyword"})
+        except Exception:
+            pass
         return keyword_plan
 
 

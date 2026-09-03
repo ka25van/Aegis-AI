@@ -10,6 +10,7 @@ data:
   # --- Backend environment overrides ---
   REDIS_URL: "redis://redis:6379/0"
   OLLAMA_BASE_URL: "http://ollama:11434"
+  OPENAI_BASE_URL: "https://openrouter.ai/api/v1"
   LLM_PROVIDER: "ollama"
   OLLAMA_MODEL: "llama3.2"
   EMBEDDING_MODEL: "nomic-embed-text"
@@ -23,7 +24,7 @@ data:
   API_V1_STR: "/api/v1"
   MAX_TOKENS: "4096"
   TEMPERATURE: "0.7"
-  OPENAI_MODEL: "gpt-4o-mini"
+  MODEL: "nvidia/nemotron-3-ultra-550b-a55b:free"
   REPOSITORY_FILE_LIMIT: "200"
   BATCH_FILE_LIMIT: "500"
   FILE_PREVIEW_LIMIT: "50"

@@ -46,6 +46,44 @@ services:
   #     retries: 3
   #       restart: unless-stopped
 
+  # Langfuse (open-source LLM observability) — optional, profile "observability"
+  # Self-hosted: run with `docker compose --profile observability up -d`
+  # Cloud alternative: set LANGFUSE_HOST=https://cloud.langfuse.com + keys in .env
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: aegis-langfuse-db
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles: ["observability"]
+
+  langfuse:
+    image: langfuse/langfuse:2.95.0
+    container_name: aegis-langfuse
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3100
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-aegis-langfuse-secret-change-me}
+      SALT: ${LANGFUSE_SALT:-aegis-salt-change-me-32chars-long}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_CSP_ENABLED: "false"
+    ports:
+      - "${LANGFUSE_PORT:-3100}:3000"
+    restart: unless-stopped
+    profiles: ["observability"]
+
   prometheus:
     image: prom/prometheus:latest
     container_name: aegis-prometheus
@@ -66,7 +104,14 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aegis}
       REDIS_URL: redis://redis:6379/0
+      ENV: ${ENV:-dev}
+      ALERT_WEBHOOK_SECRET: ${ALERT_WEBHOOK_SECRET:-}
       OLLAMA_BASE_URL: http://host.docker.internal:11434
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://us.cloud.langfuse.com}
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
       ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
@@ -79,7 +124,9 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      MODEL: ${MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+      MAX_TOKENS: ${MAX_TOKENS:-1024}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
@@ -121,4 +168,5 @@ volumes:
   postgres_data:
   redis_data:
   prometheus_data:
+  langfuse_db_data:
   # ollama_data:

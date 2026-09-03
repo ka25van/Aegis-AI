@@ -18,9 +18,18 @@ class Container:
         self._engine = engine
 
     async def initialize(self) -> None:
-        """Initialize async resources."""
-        await init_redis()
-        self._redis_client = get_redis()
+        """Initialize async resources — Redis is optional, fail open."""
+        try:
+            await init_redis()
+            self._redis_client = get_redis()
+        except Exception as e:
+            # Redis unavailable — continue with in-memory fallbacks (security.revoked, idempotency)
+            import logging
+            logging.getLogger(__name__).warning("redis_init_failed_fallback_to_memory: %s", e)
+            self._redis_client = None  # type: ignore
+
+    def is_redis_available(self) -> bool:
+        return self._redis_client is not None
 
     async def shutdown(self) -> None:
         """Cleanup async resources."""

@@ -1,0 +1,10 @@
+{"question": "where is authentication handled?", "expected_files": ["app/api/v1/endpoints/auth.py", "app/core/security.py"], "expected_chunk_contains": ["get_current_user", "create_access_token"], "project_hint": "backend"}
+{"question": "how does the planner decide which agents to run?", "expected_files": ["app/services/planner.py"], "expected_chunk_contains": ["IntentRouter", "KEYWORD_RULES"], "project_hint": "backend"}
+{"question": "how are embeddings generated?", "expected_files": ["app/services/embeddings.py"], "expected_chunk_contains": ["nomic-embed-text", "generate_embeddings"], "project_hint": "backend"}
+{"question": "what is the workflow execution order?", "expected_files": ["app/services/workflow_engine.py", "app/core/execution_plan.py"], "expected_chunk_contains": ["topological_sort", "ExecutionPlan"], "project_hint": "backend"}
+{"question": "how is memory stored across sessions?", "expected_files": ["app/services/memory.py", "app/models/memory.py"], "expected_chunk_contains": ["LongTermMemory", "SemanticMemory"], "project_hint": "backend"}
+{"question": "how do MCP tools get registered?", "expected_files": ["app/mcp/registry.py", "app/services/capability_registry.py"], "expected_chunk_contains": ["ToolRegistry", "CapabilityRegistry"], "project_hint": "backend"}
+{"question": "where are Prometheus metrics exposed?", "expected_files": ["app/services/observability.py", "app/api/v1/endpoints/observability.py"], "expected_chunk_contains": ["http_requests_total", "generate_latest"], "project_hint": "backend"}
+{"question": "how is repository cloning done?", "expected_files": ["app/services/ingestion.py"], "expected_chunk_contains": ["clone_repository", "git clone"], "project_hint": "backend"}
+{"question": "how does the frontend handle auth tokens?", "expected_files": ["frontend/src/lib/api.ts", "frontend/src/lib/AuthContext.tsx"], "expected_chunk_contains": ["localStorage", "refreshAccessToken"], "project_hint": "frontend"}
+{"question": "what Kubernetes manifests exist?", "expected_files": ["k8s/kustomization.yaml", "k8s/backend.yaml"], "expected_chunk_contains": ["kustomize", "Deployment"], "project_hint": "infra"}

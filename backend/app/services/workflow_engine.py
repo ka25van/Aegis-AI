@@ -25,6 +25,12 @@ from app.core.execution_plan import ExecutionPlan, ExecutionStep, RetryPolicy
 from app.core.task import Task
 from app.services.execution_adapters import adapt_agent, adapt_mcp, adapt_rest, adapt_python
 
+try:
+    from langfuse import observe, get_client
+except ImportError:
+    observe = lambda *a, **kw: (lambda f: f)  # type: ignore
+    get_client = lambda: None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,18 +78,29 @@ class ExecutionRuntime:
         context: ProjectContext,
         attempt_callback: Callable[[int, int], Awaitable[None]] = None,
     ) -> StepResult:
+        """Retries + timeout enforcement (execution_plan.py:29 timeout_seconds).
+
+        Classification: FatalError, ValueError/TypeError/KeyError, HTTP 4xx -> no retry.
+        Transient (ConnectError, Timeout, 5xx) -> RetryableError with backoff.
+        """
         policy = step.retry_policy or RetryPolicy()
         last_error: Optional[str] = None
         start = time.monotonic()
+        timeout = step.timeout_seconds or 120  # default 120s per step
 
         for attempt in range(1, policy.max_retries + 1):
             if self._cancelled:
                 return StepResult(status="cancelled", error="Execution cancelled", duration_ms=int((time.monotonic() - start) * 1000))
 
             try:
-                result = await executor(context)
+                # Enforce per-step timeout (was unenforced before)
+                result = await asyncio.wait_for(executor(context), timeout=timeout)
                 duration_ms = int((time.monotonic() - start) * 1000)
                 return StepResult(status="completed", output=result, duration_ms=duration_ms)
+
+            except asyncio.TimeoutError:
+                last_error = f"Step {step.id} timed out after {timeout}s"
+                logger.error(last_error)
 
             except FatalError as e:
                 last_error = str(e)
@@ -91,12 +108,25 @@ class ExecutionRuntime:
                 duration_ms = int((time.monotonic() - start) * 1000)
                 return StepResult(status="failed", error=last_error, duration_ms=duration_ms)
 
-            except Exception as e:
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
                 last_error = str(e)
-                is_retryable = not isinstance(e, FatalError)
-                if attempt < policy.max_retries and is_retryable:
+                logger.error("Fatal (bad input) on step %s: %s — not retrying", step.id, last_error)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                return StepResult(status="failed", error=last_error, duration_ms=duration_ms)
+
+            except Exception as e:
+                # Classify transport / transient errors as retryable
+                msg = str(e).lower()
+                transient_markers = ("connect", "timeout", "timed out", "503", "502", "504", "connection", "unavailable")
+                is_transient = any(m in msg for m in transient_markers) or isinstance(e, (asyncio.TimeoutError, ConnectionError, TimeoutError))
+                if not is_transient and isinstance(e, FatalError):
+                    last_error = str(e)
+                    duration_ms = int((time.monotonic() - start) * 1000)
+                    return StepResult(status="failed", error=last_error, duration_ms=duration_ms)
+                last_error = str(e)
+                if attempt < policy.max_retries:
                     delay = policy.retry_delay_seconds * (policy.backoff_multiplier ** (attempt - 1))
-                    logger.warning("Step %s attempt %d/%d failed: %s — retrying in %.1fs", step.id, attempt, policy.max_retries, last_error, delay)
+                    logger.warning("Step %s attempt %d/%d failed (retryable): %s — retrying in %.1fs", step.id, attempt, policy.max_retries, last_error, delay)
                     if attempt_callback:
                         await attempt_callback(attempt, policy.max_retries)
                     await asyncio.sleep(delay)
@@ -163,6 +193,7 @@ class WorkflowEngine:
         ctx.step_input = step.input
         return ctx
 
+    @observe(name="workflow.execute_plan", as_type="span", capture_input=False, capture_output=False)
     async def execute_plan(
         self,
         plan: ExecutionPlan,
@@ -180,6 +211,12 @@ class WorkflowEngine:
         - Pauses for approvals
         - Tracks progress
         """
+        try:
+            lf = get_client()
+            if lf:
+                lf.update_current_span(input={"intent": plan.intent, "steps": len(plan.steps), "capabilities": plan.required_capabilities, "run_id": str(run_id)}, metadata={"project_id": str(project_id)})
+        except Exception:
+            pass
         self._engineering_context = engineering_context
         runtime = ExecutionRuntime()
         step_results: Dict[str, StepResult] = {}
@@ -221,8 +258,23 @@ class WorkflowEngine:
             await self.db.commit()
             await self.db.refresh(step_record)
 
-            # Execute via ExecutionRuntime
-            result = await runtime.execute_step(step, capability.executor, context)
+            # Execute via ExecutionRuntime — wrapped in Langfuse observation for Agent Graph
+            # Map capability to observation type: agents→agent, MCP→tool, else span
+            obs_type = "agent" if step.capability in ("repository", "knowledge", "incident", "documentation", "code_review", "deploy") else ("tool" if getattr(capability, "execution_type", "") == "mcp" else "span")
+            _lf = None
+            try:
+                _lf = get_client()
+            except Exception:
+                pass
+            if _lf and hasattr(_lf, "start_as_current_observation"):
+                with _lf.start_as_current_observation(as_type=obs_type, name=f"step:{step.name}", input={"capability": step.capability, "description": step.description}, metadata={"step_id": step.id, "execution_type": getattr(capability, "execution_type", "")}) as _obs:
+                    result = await runtime.execute_step(step, capability.executor, context)
+                    try:
+                        _obs.update(output={"status": result.status, "error": result.error}, level="ERROR" if result.status == "failed" else "DEFAULT")
+                    except Exception:
+                        pass
+            else:
+                result = await runtime.execute_step(step, capability.executor, context)
 
             # Record step result
             duration_ms = result.duration_ms

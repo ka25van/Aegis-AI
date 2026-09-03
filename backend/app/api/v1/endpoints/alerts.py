@@ -5,9 +5,10 @@ import re
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.di import get_db_session
 from app.db.session import async_session_maker
 from app.services.embeddings import EmbeddingService
@@ -114,14 +115,35 @@ class AlertmanagerWebhook(BaseModel):
     externalURL: str = ""
 
 
-@router.post("/webhook")
+@router.post("/webhook")  # public: secured via ALERT_WEBHOOK_SECRET (see config.py)
 async def alert_webhook(
     payload: AlertmanagerWebhook,
+    x_webhook_secret: str | None = Header(None, alias="X-Webhook-Secret"),
     db: AsyncSession = Depends(get_db_session),
     obs: ObservabilityService = Depends(get_observability_service),
     memory: MemorySystem = Depends(get_memory_system),
 ):
-    """Receive Prometheus Alertmanager webhook payload."""
+    """Receive Prometheus Alertmanager webhook payload.
+
+    If ALERT_WEBHOOK_SECRET is set (prod), require X-Webhook-Secret header.
+    If empty (dev), webhook is open — compose/k8s should set it in prod.
+    """
+    if settings.ALERT_WEBHOOK_SECRET:
+        if x_webhook_secret != settings.ALERT_WEBHOOK_SECRET:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook secret")
+    # Idempotency: deduplicate Alertmanager retries by fingerprints within 5m
+    try:
+        from app.core.redis import get_redis
+        r = get_redis()
+        fps = sorted(a.fingerprint for a in payload.alerts if a.fingerprint)
+        if fps:
+            import hashlib
+            dedup_key = "alert_fps:" + hashlib.md5(",".join(fps).encode()).hexdigest()
+            if await r.get(dedup_key):
+                return {"status": "duplicate", "alert_count": len(payload.alerts), "dedup": True}
+            await r.setex(dedup_key, 300, "1")
+    except Exception:
+        pass
     try:
         await obs.record_request("POST", "/alerts/webhook", 200, 0)
     except Exception:

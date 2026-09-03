@@ -24,3 +24,7 @@ def get_redis() -> redis.Redis:
     if redis_client is None:
         raise RuntimeError("Redis not initialized. Call init_redis() first.")
     return redis_client
+
+
+def is_redis_available() -> bool:
+    return redis_client is not None
