@@ -1,4 +1,4 @@
-apiVersion: v1
+﻿apiVersion: v1
 kind: Service
 metadata:
   name: postgres
@@ -110,4 +110,4 @@ spec:
         resources:
           requests:
             storage: 10Gi
-        storageClassName: hostpath
+        storageClassName: standard
